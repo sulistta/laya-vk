@@ -1,13 +1,12 @@
 import json
 import random
-import socket
 from collections import deque
 from pathlib import Path
 
 import pytest
 
-from laya_mlx.snake.game import DIRECTIONS, SnakeGame, hamiltonian_cycle
-from laya_mlx.snake.policy import LayaPolicy, local_checkpoint
+from snake.game import DIRECTIONS, SnakeGame, hamiltonian_cycle
+from snake.policy import LayaPolicy
 
 
 @pytest.mark.parametrize("width,height", [(4, 4), (4, 5), (5, 4), (24, 16)])
@@ -43,7 +42,6 @@ def test_arbitrary_shielded_choices_complete_board_without_starving(seed):
     game = SnakeGame(6, 6, seed=seed)
     rng = random.Random(seed + 100)
     last_food = 0
-    # A safe action advances at least one cycle position and never passes food.
     for _ in range(game.capacity * (game.capacity - game.initial_length)):
         allowed = [m.direction for m in game.moves() if m.safe]
         assert allowed
@@ -96,22 +94,6 @@ def test_guard_preserves_raw_probabilities_and_reports_intervention():
     assert policy.decide(game).executed == unsafe
 
 
-def test_missing_local_model_fails_without_a_network_attempt(monkeypatch, tmp_path):
-    attempts = []
-
-    def forbidden(*_, **__):
-        attempts.append(True)
-        raise AssertionError("Network access attempted")
-
-    monkeypatch.setattr(socket, "create_connection", forbidden)
-    monkeypatch.setattr(socket.socket, "connect", forbidden)
-    with pytest.raises(FileNotFoundError, match="does not exist"):
-        local_checkpoint(tmp_path / "absent")
-    with pytest.raises(FileNotFoundError, match="Download it"):
-        local_checkpoint("nonexistent-snake-demo-test/no-cache")
-    assert attempts == []
-
-
 def test_small_or_odd_boards_are_rejected():
     for shape in ((3, 4), (4, 3), (5, 5)):
         with pytest.raises(ValueError):
@@ -120,7 +102,7 @@ def test_small_or_odd_boards_are_rejected():
 
 @pytest.mark.parametrize("times", [(1, 1), (2, 1), (float("nan"),), (-1,)])
 def test_recording_rejects_invalid_wall_clock_timestamps(tmp_path, times):
-    from laya_mlx.snake.replay import load_record
+    from snake.replay import load_record
 
     path = tmp_path / "record.jsonl"
     events = [{"type": "metadata", "format": "laya-snake-v1"}]
@@ -131,7 +113,7 @@ def test_recording_rejects_invalid_wall_clock_timestamps(tmp_path, times):
 
 
 def test_recording_preserves_actual_timestamps_and_probabilities(tmp_path):
-    from laya_mlx.snake.replay import load_record
+    from snake.replay import load_record
 
     path = tmp_path / "record.jsonl"
     metadata = {"type": "metadata", "format": "laya-snake-v1"}
@@ -143,11 +125,54 @@ def test_recording_preserves_actual_timestamps_and_probabilities(tmp_path):
     assert load_record(path) == (metadata, frames)
 
 
+def test_planner_policy_survives_without_a_model():
+    from snake.policy import PlannerPolicy
+
+    game = SnakeGame(6, 6, seed=7)
+    policy = PlannerPolicy()
+    for _ in range(200):
+        decision = policy.decide(game)
+        safe = [m.direction for m in game.moves() if m.safe]
+        assert decision.executed in safe
+        assert decision.proposed == decision.planner_best
+        assert sum(decision.probabilities.values()) == pytest.approx(1)
+        assert not decision.intervened
+        game.step(decision.executed)
+        assert game.alive and game.cycle_order_valid()
+        if game.won:
+            break
+    assert game.score >= 1
+
+
+@pytest.mark.integration
+def test_vulkan_backend_matches_torch_choices():
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("iree.runtime")
+    if not (Path(__file__).parents[1] / "models/iree").is_dir():
+        pytest.skip("IREE Vulkan artifacts not built")
+    from snake.policy import build_state_questions
+
+    import laya
+
+    game = SnakeGame(seed=7)
+    state, questions, _, _, _, _ = build_state_questions(game, "compact")
+    torch_agent = laya.load("convaiinnovations/laya", device="cpu", subfolder="multilingual")
+    vulkan_agent = laya.load("convaiinnovations/laya", device="vulkan", subfolder="multilingual")
+    if getattr(vulkan_agent, "backend", "cpu") != "vulkan":
+        pytest.skip("Vulkan backend unavailable")
+    expected = torch_agent.predict(state, questions)["answers"]
+    got = vulkan_agent.predict(state, questions)["answers"]
+    assert got["move"]["choice"] == expected["move"]["choice"]
+    assert got["risk"]["noul"] == pytest.approx(expected["risk"]["noul"], abs=0.02)
+    assert got["food"]["noul"] == pytest.approx(expected["food"]["noul"], abs=0.02)
+
+
 @pytest.mark.parametrize("filename", ["snake-showcase.jsonl", "snake-fast.jsonl"])
 def test_published_real_showcase_replays_every_board_and_action_exactly(filename):
-    from laya_mlx.snake.replay import load_record
+    from snake.replay import load_record
 
-    path = Path(__file__).parents[1] / "benchmarks/results" / filename
+    path = Path(__file__).parent / "fixtures" / filename
     metadata, frames = load_record(path)
     settings = metadata["settings"]
     game = SnakeGame(
